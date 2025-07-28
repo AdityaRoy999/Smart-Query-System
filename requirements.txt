@@ -1,5 +1,5 @@
 streamlit
 numpy
-docx
+python-docx
 requests
-PyPDF2
+PyPDF2>=3.0.0

@@ -3,6 +3,7 @@ import re
 import json
 import tempfile
 import time
+import io
 import streamlit as st
 import numpy as np
 import docx
@@ -55,9 +56,6 @@ def chunk_text(text, max_tokens=200):
     return chunks
 
 # --- API CALLS (Functions now take the key/URL as arguments) ---
-# @st.cache_data is a powerful feature that will cache the output of this function.
-# If the same function with the same arguments is called again, Streamlit will
-# skip execution and return the cached result.
 @st.cache_data(show_spinner=False)
 def get_embedding(text_chunk, api_key):
     """Generates embedding for a given text chunk using the Gemini API with retry logic."""
@@ -85,7 +83,6 @@ def get_embedding(text_chunk, api_key):
             raise RuntimeError(f"Failed to parse API response: {e}\nResponse: {resp.text}")
     return None
 
-# Caching the entire embedding process for a given list of chunks
 @st.cache_data(show_spinner=False)
 def embed_chunks(_chunks, api_key):
     """
@@ -96,7 +93,6 @@ def embed_chunks(_chunks, api_key):
     headers = {"Content-Type": "application/json"}
     
     all_embedded_chunks = []
-    # Gemini API has a limit of 100 requests per batchEmbedContents call.
     BATCH_SIZE = 100 
 
     progress_bar = st.progress(0, text="Embedding document chunks...")
@@ -128,10 +124,9 @@ def embed_chunks(_chunks, api_key):
                 ]
                 all_embedded_chunks.extend(batch_embedded)
                 
-                # Update progress after a successful batch
                 progress_val = min((i + BATCH_SIZE) / len(_chunks), 1.0)
                 progress_bar.progress(progress_val, text=f"Embedded {min(i + BATCH_SIZE, len(_chunks))}/{len(_chunks)} chunks...")
-                break # Exit retry loop on success
+                break
 
             except requests.exceptions.RequestException as e:
                 if attempt < max_retries - 1:
@@ -153,17 +148,25 @@ def generate_response(query, relevant_chunks, api_key):
     context = "\n\n".join([f"Clause: {c['chunk']}\nScore: {c['score']:.4f}" for c in relevant_chunks])
     
     prompt = f"""
-You are a professional assistant trained to review documents. Your task is to answer a user's query based *only* on the relevant clauses provided from the document.
+You are a professional assistant trained to review documents. Your task is to give a direct answer to a user's query based *only* on the relevant clauses provided from the document.
 
-Based on the user's query:
+**User Query:**
 "{query}"
 
-And these relevant clauses extracted from the document:
+**Relevant Clauses from Document:**
 ---
 {context}
 ---
 
-Please provide a concise, natural language answer in one or two sentences. Clearly state whether the user's request is supported by the provided text or not. Do not make assumptions or use external knowledge. If the provided clauses are not sufficient to answer, state that the information is not found in the relevant sections.
+**Instructions:**
+1.  Provide a direct, concise, natural language answer in one or two sentences.
+2.  Start your answer directly with "Yes," "No," or state that the information isn't available.
+3.  **Do not** use phrases like "According to the text," "The provided clauses state," or similar preambles. Answer the question as if you are the definitive source.
+4.  If the information is not in the clauses, state that the answer cannot be found in the provided sections.
+
+**Example Answer Formats:**
+- "Yes, emergency treatment is covered for up to six weeks per trip."
+- "No, the policy does not cover this specific situation."
 """
     
     headers = {"Content-Type": "application/json"}
@@ -204,9 +207,41 @@ def search_relevant_chunks(query, embedded_chunks, api_key, top_k=3):
     
     return sorted(scored_chunks, key=lambda x: x["score"], reverse=True)[:top_k]
 
+# --- REPORT GENERATION ---
+def create_report_text(query, answer, chunks):
+    """Creates a formatted string for the report."""
+    report = f"Query:\n{query}\n\n"
+    report += f"Answer:\n{answer}\n\n"
+    report += "--- Relevant Clauses ---\n\n"
+    for chunk in chunks:
+        report += f"Score: {chunk['score']:.4f}\n"
+        report += f"{chunk['chunk']}\n\n"
+    return report
+
+def create_docx_report(query, answer, chunks):
+    """Creates a DOCX report in memory."""
+    doc = docx.Document()
+    doc.add_heading('Smart Document Query Report', 0)
+    
+    doc.add_heading('User Query', level=1)
+    doc.add_paragraph(query)
+    
+    doc.add_heading('Generated Answer', level=1)
+    doc.add_paragraph(answer)
+    
+    doc.add_heading('Relevant Clauses', level=1)
+    for chunk in chunks:
+        doc.add_paragraph(f"Score: {chunk['score']:.4f}", style='Intense Quote')
+        doc.add_paragraph(chunk['chunk'])
+        doc.add_paragraph() # Add a space
+        
+    bio = io.BytesIO()
+    doc.save(bio)
+    return bio.getvalue()
+
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="Smart Document Query", layout="wide")
-st.title(" | Smart Document Query System")
+st.title(" CodeBusters | Smart Document Query System")
 
 # --- API KEY INPUT ---
 st.sidebar.title("Configuration")
@@ -220,10 +255,13 @@ if not GEMINI_API_KEY:
 # --- MAIN APP LOGIC ---
 st.markdown("Upload a document (`PDF` or `DOCX`) and ask a question in natural language.")
 
+# Initialize session state
 if 'processed_data' not in st.session_state:
     st.session_state.processed_data = None
 if 'file_name' not in st.session_state:
     st.session_state.file_name = None
+if 'report_data' not in st.session_state:
+    st.session_state.report_data = None
 
 col1, col2 = st.columns(2)
 
@@ -232,11 +270,11 @@ with col1:
     uploaded_file = st.file_uploader("📎 Select a PDF or DOCX file", type=["pdf", "docx"])
     
     if uploaded_file:
-        # Use file content as part of the cache key to detect changes
         file_bytes = uploaded_file.getvalue()
         file_id = f"{uploaded_file.name}-{len(file_bytes)}"
 
         if st.session_state.file_name != file_id:
+            st.session_state.report_data = None # Clear old report data
             with st.spinner(f"Reading and analyzing '{uploaded_file.name}'..."):
                 temp_dir = tempfile.mkdtemp()
                 temp_path = os.path.join(temp_dir, uploaded_file.name)
@@ -250,7 +288,6 @@ with col1:
                          st.error("Could not extract any text or chunks from the document.")
                          st.stop()
                     
-                    # The result of this function call will be cached
                     embedded_chunks = embed_chunks(tuple(chunks), GEMINI_API_KEY)
                     st.session_state.processed_data = embedded_chunks
                     st.session_state.file_name = file_id
@@ -279,11 +316,19 @@ with col2:
                     
                     if not top_chunks:
                         st.warning("Could not find any relevant information for your query.")
+                        st.session_state.report_data = None
                     else:
                         answer = generate_response(user_query, top_chunks, GEMINI_API_KEY)
                         
                         st.success("💡 Answer")
                         st.markdown(f"> {answer}")
+
+                        # Store data for report download
+                        st.session_state.report_data = {
+                            "query": user_query,
+                            "answer": answer,
+                            "chunks": top_chunks
+                        }
 
                         with st.expander("📚 View most relevant clauses found"):
                             for chunk in top_chunks:
@@ -293,7 +338,30 @@ with col2:
 
                 except Exception as e:
                     st.error(f"❌ An error occurred during search: {str(e)}")
+                    st.session_state.report_data = None
         elif not st.session_state.processed_data:
             st.warning("Please upload and process a document first.")
         else:
             st.warning("Please enter a query.")
+
+    # --- DOWNLOAD SECTION ---
+    if st.session_state.report_data:
+        st.subheader("3. Download Report")
+        report_data = st.session_state.report_data
+        
+        dl_col1, dl_col2 = st.columns(2)
+
+        with dl_col1:
+            st.download_button(
+                label="📥 Download as TXT",
+                data=create_report_text(report_data['query'], report_data['answer'], report_data['chunks']),
+                file_name="report.txt",
+                mime="text/plain"
+            )
+        with dl_col2:
+            st.download_button(
+                label="📥 Download as DOCX",
+                data=create_docx_report(report_data['query'], report_data['answer'], report_data['chunks']),
+                file_name="report.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
